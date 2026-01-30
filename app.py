@@ -1,173 +1,205 @@
 import os
 import cv2
 import json
-import requests
-import streamlit as st
 import numpy as np
+import streamlit as st
 import google.generativeai as genai
+import requests
 from dotenv import load_dotenv
 from datetime import datetime
 from ultralytics import YOLO
+from tamper import store_evidence, verify_chain, get_evidence_count
 
-# ----------------
-# LOAD SECRETS
-
+# -----------------------------
+# LOAD ENV + GEMINI
+# -----------------------------
 load_dotenv()
 
+# N8N webhook URL (optional)
+_raw_n8n = os.getenv("N8N_WEBHOOK_URL") or ""
+# normalize and strip accidental surrounding whitespace or quotes
+N8N_WEBHOOK_URL = _raw_n8n.strip().strip('"').strip("'")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-flash-latest")
+gemini_model = genai.GenerativeModel("gemini-flash-latest")
 
-# -------------------
+# --- N8N helper ---
+def send_to_n8n(text, label, confidence, reason):
+    payload = {
+        "text": text,
+        "label": label,
+        "confidence": confidence,
+        "reason": reason,
+        "timestamp": datetime.utcnow().isoformat()
+    }
+    
+    try:
+        requests.post(N8N_WEBHOOK_URL, json=payload, timeout=10)
+    except Exception as e:
+        print("n8n error:", e)
+
+# -----------------------------
 # LOAD YOLO MODEL
-
+# -----------------------------
 @st.cache_resource
-def load_yolo_model():
-    return YOLO("yolo26n.pt")
+def load_yolo():
+    return YOLO("yolo26n_finetuned.pt")
 
-yolo_model = load_yolo_model()
+yolo_model = load_yolo()
 
-# ------------------
+# -----------------------------
 # STREAMLIT CONFIG
-
+# -----------------------------
 st.set_page_config(
-    page_title=" AI Drug Detection System",
+    page_title="🚨 AI Drug Detection System",
     page_icon="🚨",
     layout="centered"
 )
 
-st.title(" AI Drug Detection System")
-st.caption("Text · Image · Live Webcam · Alerts")
+st.title("🚨 AI Drug Detection System")
+st.caption("Text · Image · Live Webcam · Tamper-Proof Evidence")
 
-tab1, tab2, tab3 = st.tabs([" TEXT", " IMAGE", " WEBCAM"])
+tab1, tab2, tab3 = st.tabs(["📝 Text", "🖼 Image", "📷 Webcam"])
 
-# ----------
-# TEXT TAB
-
+# =============================
+# 📝 TEXT TAB
+# =============================
 with tab1:
-    text = st.text_area("Enter text")
+    text = st.text_area("Enter text to analyze")
 
-    if st.button("Analyze Text"):
+    if st.button("Analyze Text") and text.strip():
         prompt = f"""
-Classify text into ONE category:
+Classify text into EXACTLY ONE:
 Illegal Drug Intent
 Drug Promotion
 Depression / Mental Health
 Safe / Non-Drug
 
-Return JSON:
+Return JSON only:
 {{"label":"","confidence":0.0,"reason":""}}
 
 Text: "{text}"
 """
 
-        response = model.generate_content(prompt)
-        raw_text = getattr(response, "text", str(response))
-
-        # Try to parse JSON strictly, then try to extract a JSON substring, otherwise keep raw
-        result = None
         try:
-            result = json.loads(raw_text)
-        except Exception:
-            # attempt to extract first JSON object found in the text
-            import re
+            response = gemini_model.generate_content(prompt)
+            raw_response = response.text.strip()
+            
+            # Try to extract JSON from response
+            result = None
+            try:
+                result = json.loads(raw_response)
+            except json.JSONDecodeError:
+                # Try to find JSON in the response
+                import re
+                json_match = re.search(r'\{.*\}', raw_response, re.DOTALL)
+                if json_match:
+                    try:
+                        result = json.loads(json_match.group(0))
+                    except json.JSONDecodeError:
+                        pass
+            
+            if result is None:
+                st.error(f"Invalid API response. Raw response: {raw_response}")
+                st.stop()
 
-            m = re.search(r"\{.*\}", raw_text, re.DOTALL)
-            if m:
-                try:
-                    result = json.loads(m.group(0))
-                except Exception:
-                    result = None
+            label = result.get("label", "Unknown")
+            confidence = float(result.get("confidence", 0.0))
+            reason = result.get("reason", "")
 
-        if result is None:
-            st.error("Model response could not be parsed as JSON — showing raw response for debugging.")
-            with st.expander("Raw model response"):
-                st.text(raw_text)
-            result = {"label": "Unknown", "confidence": 0.0, "reason": raw_text}
-        else:
-            # show parsed result for visibility
-            st.subheader("Parsed model result")
-            st.json(result)
+            st.success(label)
+            st.write("Confidence:", confidence)
+            st.write("Reason:", reason)
 
-        # Display primary fields
-        label = result.get("label") or result.get("Label") or result.get("prediction") or "Unknown"
-        confidence = result.get("confidence") or result.get("score") or 0.0
-        reason = result.get("reason") or result.get("explanation") or ""
+            # 🔐 Tamper-proof log
+            evidence_result = store_evidence({
+                "type": "text_analysis",
+                "label": label,
+                "confidence": confidence,
+                "reason": reason,
+                "text_length": len(text)
+            })
+            st.success(f"Evidence stored: Block #{evidence_result['block_index']}")
 
-        st.success(label)
-        st.write("Confidence:", confidence)
-        st.write("Reason:", reason)
+            # Send text analysis to N8N webhook if configured
+            if N8N_WEBHOOK_URL:
+                send_to_n8n(text, label, confidence, reason)
+                st.info("Sent to N8N")
 
-# ----------
-# IMAGE TAB 
+        except Exception as e:
+            st.error(f"Error: {e}")
 
+# =============================
+# 🖼 IMAGE TAB
+# =============================
 with tab2:
-    img = st.file_uploader("Upload image", ["jpg", "png"])
-    if img:
-        # Convert uploaded file to image
-        img_array = np.asarray(bytearray(img.read()), dtype=np.uint8)
-        img_bgr = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        
-        # Run YOLO detection
+    image_file = st.file_uploader("Upload image", ["jpg", "png", "jpeg"])
+
+    if image_file:
+        img_bytes = np.asarray(bytearray(image_file.read()), dtype=np.uint8)
+        img_bgr = cv2.imdecode(img_bytes, cv2.IMREAD_COLOR)
+
         results = yolo_model(img_bgr)
-        
-        # Draw detections on image
-        detected_img = results[0].plot()
-        detected_img_rgb = cv2.cvtColor(detected_img, cv2.COLOR_BGR2RGB)
-        
-        # Display original and detected images side by side
-        col1, col2 = st.columns(2)
-        with col1:
-            st.subheader("Original Image")
-            st.image(img_rgb)
-        
-        with col2:
-            st.subheader("YOLO Detection")
-            st.image(detected_img_rgb)
-        
-        # Show detection results
-        st.subheader("Detection Results")
+        annotated = results[0].plot()
+        annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+
+        st.image(annotated_rgb, caption="YOLO Detection")
+
         detections = results[0].boxes
-        if len(detections) > 0:
-            st.success(f"Found {len(detections)} object(s)")
-            for i, box in enumerate(detections):
-                conf = box.conf[0].item()
-                st.write(f"Object {i+1} - Confidence: {conf:.2%}")
-        else:
+        if len(detections) == 0:
             st.info("No objects detected")
+        else:
+            for box in detections:
+                conf = box.conf[0].item()
+                cls_id = int(box.cls[0])
+                label = yolo_model.names[cls_id]
 
-# ------------
-# WEBCAM TAB 
+                st.write(f"{label} — {conf:.2%}")
 
+                # 🔐 Tamper-proof log
+                store_evidence({
+                    "type": "image_detection",
+                    "label": label,
+                    "confidence": conf
+                })
+
+# =============================
+# 📷 WEBCAM TAB
+# =============================
 with tab3:
     st.warning("Webcam works only in local VS Code")
 
-    run = st.checkbox("Start Webcam")
+    start = st.checkbox("Start Webcam")
 
-    if run:
+    if start:
         cap = cv2.VideoCapture(0)
-        frame_holder = st.empty()
-        stats_holder = st.empty()
+        frame_box = st.empty()
+        stats = st.empty()
 
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
 
-            # Run YOLO detection
             results = yolo_model(frame)
-            
-            # Draw detections on frame
-            detected_frame = results[0].plot()
-            detected_frame_rgb = cv2.cvtColor(detected_frame, cv2.COLOR_BGR2RGB)
-            
-            # Display frame
-            frame_holder.image(detected_frame_rgb)
-            
-            
+            annotated = results[0].plot()
+            annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+
+            frame_box.image(annotated_rgb)
+
             detections = results[0].boxes
-            stats_holder.metric("Objects Detected", len(detections))
+            stats.metric("Objects Detected", len(detections))
+
+            for box in detections:
+                conf = box.conf[0].item()
+                cls_id = int(box.cls[0])
+                label = yolo_model.names[cls_id]
+
+                # 🔐 Tamper-proof log
+                store_evidence({
+                    "type": "webcam_detection",
+                    "label": label,
+                    "confidence": conf
+                })
 
         cap.release()
