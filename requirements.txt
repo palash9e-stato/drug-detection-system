@@ -1,7 +1,0 @@
-streamlit
-google-generativeai
-opencv-python
-python-dotenv
-requests
-numpy
-ultralytics
