@@ -1,0 +1,12 @@
+streamlit
+google-genai
+opencv-python
+python-dotenv
+requests
+numpy
+ultralytics
+plotly
+feedparser
+pyngrok
+pandas
+pillow
