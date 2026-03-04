@@ -15,8 +15,7 @@ GuardianAI is a powerful, AI-driven surveillance and narcotics detection app bui
 7. [Environment Variables](#environment-variables)
 8. [Running the App](#running-the-app)
 9. [Security Features](#security-features)
-10. [Offline Mode](#offline-mode)
-11. [FAQ](#faq)
+
 
 ---
 
