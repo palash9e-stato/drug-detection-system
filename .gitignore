@@ -1,0 +1,20 @@
+# Environments
+.env
+.venv/
+__pycache__/
+
+# Runtime Data
+*.json
+!slang_db.json
+.current_session_evidence
+.heartbeat
+.operator_pulse
+.swarm_beacon/
+*.LOCKED
+
+# Secrets
+admin_secrets.yaml
+
+# Vault
+vault/*
+!vault/.gitkeep
